@@ -1,0 +1,104 @@
+name: Kong Gateway Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  pages: write
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cypress-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          repository: t7qchina/kong-test
+          ref: master
+
+      - name: Start Postgres container
+        run: |
+          docker run -d --name kong-db \
+            -e POSTGRES_USER=kong \
+            -e POSTGRES_PASSWORD=kong \
+            -e POSTGRES_DB=kong \
+            -p 5432:5432 \
+            postgres:latest
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U kong && break
+            echo "Waiting for Postgres..."
+            sleep 2
+          done
+
+      - name: Start Kong container
+        run: |
+          docker run -d --name kong-cp \
+            --link kong-db \
+            -p 8000:8000 \
+            -p 8001:8001 \
+            -p 8002:8002 \
+            -p 8443:8443 \
+            -p 8444:8444 \
+            -e KONG_DATABASE=postgres \
+            -e KONG_PG_HOST=kong-db \
+            -e KONG_PG_USER=kong \
+            -e KONG_PG_PASSWORD=kong \
+            -e KONG_ADMIN_LISTEN="0.0.0.0:8001, 0.0.0.0:8444 ssl" \
+            -e KONG_PROXY_LISTEN="0.0.0.0:8000, 0.0.0.0:8443 ssl" \
+            -e KONG_ADMIN_GUI_URL="http://localhost:8002" \
+            kong/kong-gateway:latest \
+            sh -c "kong migrations bootstrap && kong start"
+
+      - name: Wait for Kong
+        run: |
+          for i in {1..30}; do
+            if curl -sSf http://localhost:8001/ > /dev/null; then
+              echo "Kong Admin API is ready at http://localhost:8001"
+              break
+            else
+              echo "Waiting for Kong..."
+              sleep 2
+            fi
+          done
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Cypress Tests
+        run: npx cypress run
+
+      - name: Generate Allure Report
+        if: always()
+        run: |
+          npm install -g allure-commandline
+          allure generate ./allure-results -o allure-report --clean
+
+      - name: Upload Pages Artifact
+        if: always()
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: allure-report
+
+      - name: Deploy to GitHub Pages
+        if: always()
+        uses: actions/deploy-pages@v4
